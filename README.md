@@ -36,26 +36,35 @@ No dependencies beyond Python 3. No subscriptions, no bloat.
 python3 clean_mac.py
 ```
 
+### Controls
+
+- **↑↓** or **j/k** -- Navigate menus and lists
+- **Enter** -- Select / Confirm
+- **Space** -- Toggle selection (in review screens)
+- **s** -- Select all (in category detail)
+- **d** / **n** -- Deselect all
+- **Esc** / **q** / **v** -- Go back / Cancel
+
 ### Menu options
 
-- **s** -- Scan system for junk. First step, required before reviewing or cleaning.
-- **r** -- Review what was found. Toggle categories or individual entries on/off.
-- **c** -- Clean everything selected. Asks for confirmation.
-- **a** -- Auto-clean (scan + delete everything, no confirmation).
-- **q** -- Quit.
+- **Escanear sistema** -- Scan system for junk. First step, required before reviewing or cleaning.
+- **Revisar / seleccionar** -- Review what was found. Toggle categories or individual entries on/off.
+- **Limpiar seleccionado** -- Clean everything selected. Asks for confirmation.
+- **Auto-limpieza** -- Auto-clean (scan + delete everything, no confirmation).
+- **Salir** -- Quit.
 
 ### Typical flow
 
-1. Press `s` to scan. Takes a few seconds while it walks the filesystem.
-2. Press `r` to review. Navigate categories with number keys, toggle items, go back with `v`.
-3. Press `c` to clean. Confirm with `y`.
+1. Select "Escanear sistema" to scan. Takes a few seconds while it walks the filesystem.
+2. Select "Revisar / seleccionar" to review. Navigate categories, press Enter to see entries, Space to toggle items, Esc to go back.
+3. Select "Limpiar todo lo seleccionado" to clean. Confirm the dialog.
 4. Done.
 
 ## Requirements
 
 - macOS (the script checks at startup)
 - Python 3.7 or later
-- No pip packages needed -- standard library only
+- No pip packages needed -- standard library only (uses `curses` for the TUI)
 
 ## Safety
 

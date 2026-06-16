@@ -10,26 +10,12 @@ import sys
 import shutil
 import subprocess
 import platform
-import fnmatch
-import re
+import curses
+import time
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Union
+from typing import Dict, List, Optional
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-
-# ── ANSI helpers ────────────────────────────────────────────────────────────
-RST  = "\033[0m"
-BOLD = "\033[1m"
-DIM  = "\033[2m"
-CYAN = "\033[36m"
-GREEN  = "\033[32m"
-YELLOW = "\033[33m"
-RED   = "\033[31m"
-MAGENTA = "\033[35m"
-WHITE  = "\033[37m"
-BG_MAGENTA = "\033[45m"
-BG_GREEN   = "\033[42m"
-BG_RED     = "\033[41m"
 
 def fmt_size(b: int) -> str:
     for u in ("B", "KB", "MB", "GB", "TB"):
@@ -38,14 +24,36 @@ def fmt_size(b: int) -> str:
         b /= 1024
     return f"{b:.1f} PB"
 
-def clear(): os.system("clear")
+# ── Curses color pairs ──────────────────────────────────────────────────────
+# We'll init them inside curses_main
 
-def banner():
-    print(f"{MAGENTA}{BOLD}")
-    print("╔══════════════════════════════════════════════════════╗")
-    print("║             🧹  M A C   C L E A N E R               ║")
-    print("╚══════════════════════════════════════════════════════╝")
-    print(RST)
+def _draw_banner(scr, y=0):
+    """Draw Mac Cleaner banner inside a curses window."""
+    h, w = scr.getmaxyx()
+    box_w = min(54, w - 2)
+    box_x = max(0, (w - box_w) // 2)
+    try:
+        scr.attron(curses.color_pair(5))
+        scr.addstr(y, box_x, "╔" + "═" * (box_w - 2) + "╗")
+        title = "  🧹  M A C   C L E A N E R  "
+        tx = max(0, (w - len(title)) // 2)
+        scr.addstr(y + 1, tx, title, curses.A_BOLD)
+        scr.addstr(y + 2, box_x, "╚" + "═" * (box_w - 2) + "╝")
+        scr.attroff(curses.color_pair(5))
+    except curses.error:
+        pass
+    return y + 4
+
+def _draw_footer(scr, keys_help):
+    """Draw keybinding hints at bottom."""
+    h, w = scr.getmaxyx()
+    try:
+        scr.attron(curses.color_pair(8))
+        _safe_addstr(scr, h - 2, 0, " " * (w - 1))
+        _safe_addstr(scr, h - 2, max(0, (w - len(keys_help)) // 2), keys_help)
+        scr.attroff(curses.color_pair(8))
+    except curses.error:
+        pass
 
 # ── Data structures ─────────────────────────────────────────────────────────
 
@@ -459,170 +467,581 @@ def scan_all_categories():
             del CATEGORIES_REGISTRY[key]
 
 
-# ── Display helpers ─────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# CURSES TUI
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def print_category(cat: JunkCategory, indent: int = 2):
-    pref = " " * indent
-    n = cat.selected_count
-    t = cat.total_bytes if n > 0 else 0
-    print(f"{pref}{BOLD}{cat.name}{RST}  {DIM}({n} elementos, {fmt_size(t)}){RST}")
-    if cat.description:
-        print(f"{pref}{DIM}{cat.description}{RST}")
+def _safe_addstr(scr, y, x, text, *args):
+    """Add string to curses window, clipping to screen bounds."""
+    h, w = scr.getmaxyx()
+    if y < 0 or y >= h or x >= w:
+        return
+    text = text[:max(0, w - x)]
+    if not text:
+        return
+    try:
+        scr.addstr(y, x, text, *args)
+    except curses.error:
+        pass
 
+def _draw_list(scr, start_y, items, current_idx, scroll_offset, selected_fn=None,
+               show_checkbox=True):
+    """Draw a scrollable list. Returns number of lines drawn.
+    
+    items: list of (label, ...) tuples or strings
+    selected_fn: optional function(item) -> bool for checkbox state
+    """
+    h, w = scr.getmaxyx()
+    max_visible = max(1, h - start_y - 4)  # leave room for footer
+    drawn = 0
+    for i, item in enumerate(items):
+        if i < scroll_offset:
+            continue
+        if drawn >= max_visible:
+            break
+        y = start_y + drawn
+        label = item[0] if isinstance(item, tuple) else item
+        is_current = (i == current_idx)
+        
+        if show_checkbox and selected_fn:
+            sel = selected_fn(item)
+            checkbox = "[✔]" if sel else "[ ]"
+        else:
+            checkbox = ""
+            sel = False
+        
+        # Truncate label to fit
+        avail = w - 4 - len(checkbox) - 3
+        if len(label) > avail:
+            label = label[:avail - 1] + "…"
+        
+        line = f" {checkbox} {label}" if checkbox else f"  {label}"
+        
+        if is_current:
+            scr.attron(curses.A_REVERSE)
+            _safe_addstr(scr, y, 0, line.ljust(w - 1))
+            scr.attroff(curses.A_REVERSE)
+        elif sel:
+            scr.attron(curses.color_pair(2))
+            _safe_addstr(scr, y, 0, line)
+            scr.attroff(curses.color_pair(2))
+        else:
+            scr.attron(curses.color_pair(8))
+            _safe_addstr(scr, y, 0, line)
+            scr.attroff(curses.color_pair(8))
+        drawn += 1
+    
+    return drawn
 
-def print_entries(cat: JunkCategory, show_all: bool = False):
-    for i, e in enumerate(cat.entries, 1):
-        mark = f"{GREEN}✔{RST}" if e.selected else f"{RED}✘{RST}"
-        path_display = str(e.path)
-        if len(path_display) > 80:
-            path_display = "..." + path_display[-77:]
-        if show_all or e.selected:
-            print(f"     [{mark}] {fmt_size(e.size_bytes):>10}  {DIM}{path_display}{RST}")
+def _menu_checkboxes(scr, title, items, selected_fn, toggle_fn,
+                     select_all_fn=None, deselect_all_fn=None,
+                     extra_footer=""):
+    """Menu with checkboxes. Arrow keys + space to toggle.
+    items: list of tuples (label, data)
+    Returns None to go back.
+    """
+    current = 0
+    scroll = 0
+    h, w = scr.getmaxyx()
+    
+    while True:
+        scr.clear()
+        y = _draw_banner(scr)
+        scr.attron(curses.A_BOLD)
+        _safe_addstr(scr, y, 2, title)
+        scr.attroff(curses.A_BOLD)
+        y += 2
+        
+        # Show totals
+        total_selected = sum(1 for item in items if selected_fn(item))
+        total_items = len(items)
+        total_bytes = sum(item[2] for item in items if selected_fn(item) and len(item) > 2 and isinstance(item[2], (int, float)))
+        
+        scr.attron(curses.color_pair(8))
+        _safe_addstr(scr, y, 2, f"{total_selected}/{total_items} seleccionados  |  {fmt_size(total_bytes)}" if total_bytes > 0 else f"{total_selected}/{total_items} seleccionados")
+        scr.attroff(curses.color_pair(8))
+        y += 2
+        
+        _draw_list(scr, y, items, current, scroll, selected_fn=selected_fn)
+        
+        footer = f"↑↓ flechas  [espacio] toggle  {extra_footer}  esc/q volver"
+        if select_all_fn:
+            footer = "↑↓ flechas  [espacio] toggle  t:todo n:nada  esc/q volver"
+        _draw_footer(scr, footer)
+        scr.refresh()
+        
+        key = scr.getch()
+        if key == curses.KEY_RESIZE:
+            scr.clear()
+            h, w = scr.getmaxyx()
+            scroll = min(scroll, max(0, len(items) - 1))
+            continue
+        elif key in (curses.KEY_UP, ord('k')):
+            if current > 0:
+                current -= 1
+                if current < scroll:
+                    scroll = current
+        elif key in (curses.KEY_DOWN, ord('j')):
+            if current < len(items) - 1:
+                current += 1
+                max_vis = max(1, h - (y + 2) - 4)
+                if current >= scroll + max_vis:
+                    scroll = current - max_vis + 1
+        elif key == ord(' '):
+            if 0 <= current < len(items):
+                toggle_fn(items[current])
+        elif key in (10, 13, curses.KEY_ENTER):
+            return current
+        elif key in (27, ord('q'), ord('v')):
+            return None
+        elif key in (ord('t'), ord('s')):
+            if select_all_fn:
+                select_all_fn()
+        elif key in (ord('n'), ord('d')):
+            if deselect_all_fn:
+                deselect_all_fn()
 
+def _confirm_dialog(scr, msg, default=False):
+    """Show a yes/no confirmation dialog. Returns bool."""
+    h, w = scr.getmaxyx()
+    selected = 0 if default else 1  # 0=Yes, 1=No
+    
+    while True:
+        scr.clear()
+        y = _draw_banner(scr)
+        y += 1
+        scr.attron(curses.color_pair(3) | curses.A_BOLD)
+        _safe_addstr(scr, y, max(0, (w - len(msg)) // 2), msg)
+        scr.attroff(curses.color_pair(3) | curses.A_BOLD)
+        y += 3
+        
+        options = ["  Sí, borrar  ", "  No, cancelar  "]
+        for i, opt in enumerate(options):
+            if i == selected:
+                scr.attron(curses.A_REVERSE)
+                _safe_addstr(scr, y + i, max(0, (w - len(opt)) // 2), opt)
+                scr.attroff(curses.A_REVERSE)
+            else:
+                _safe_addstr(scr, y + i, max(0, (w - len(opt)) // 2), opt)
+        
+        _draw_footer(scr, "←→ seleccionar  ↵ confirmar")
+        scr.refresh()
+        
+        key = scr.getch()
+        if key in (curses.KEY_LEFT, ord('h')):
+            selected = max(0, selected - 1)
+        elif key in (curses.KEY_RIGHT, ord('l')):
+            selected = min(1, selected + 1)
+        elif key in (10, 13, curses.KEY_ENTER):
+            return selected == 0
+        elif key in (27, ord('q')):
+            return False
 
-# ── Interactive menu ────────────────────────────────────────────────────────
+def _show_message(scr, lines, wait=True):
+    """Show a message screen. Returns when key pressed or immediately."""
+    scr.clear()
+    y = _draw_banner(scr)
+    y += 1
+    for line in lines:
+        _safe_addstr(scr, y, 2, line)
+        y += 1
+    if wait:
+        _draw_footer(scr, "Presiona cualquier tecla para continuar...")
+    scr.refresh()
+    if wait:
+        scr.getch()
 
-def prompt_yn(msg: str, default: bool = True) -> bool:
-    d = "Y/n" if default else "y/N"
-    r = input(f"  {msg} [{d}]: ").strip().lower()
-    if not r:
-        return default
-    return r in ("y", "yes", "s", "si", "sí")
-
-
-def menu_main() -> str:
-    """Returns 'scan', 'review', 'clean', 'quit'."""
-    clear()
-    banner()
-    print(f"  {BOLD}Menú principal{RST}\n")
-    print(f"  {YELLOW}[s]{RST}   Escanear sistema (detectar basura)")
-    print(f"  {YELLOW}[r]{RST}   Revisar / seleccionar qué limpiar")
-    print(f"  {YELLOW}[c]{RST}   Limpiar todo lo seleccionado  {RED}(¡irreversible!){RST}")
-    print(f"  {YELLOW}[a]{RST}   Auto-limpieza (escanear + limpiar todo sin preguntar)")
-    print(f"  {YELLOW}[q]{RST}   Salir\n")
-    ch = input(f"  {CYAN}Elegir [{BOLD}s,r,c,a,q{RST}{CYAN}]:{RST} ").strip().lower()
-    if ch in ("s", "scan"):
-        return "scan"
-    elif ch in ("r", "review", "revisar"):
-        return "review"
-    elif ch in ("c", "clean", "limpiar"):
-        return "clean"
-    elif ch in ("a", "auto"):
-        return "auto"
-    elif ch in ("q", "quit", "salir"):
-        return "quit"
-    return "unknown"
-
-
-def menu_summary():
-    """Show total summary of selected items."""
-    clear()
-    banner()
+def _show_summary(scr):
+    """Show scan results summary. Returns total_items, total_bytes."""
+    scr.clear()
+    y = _draw_banner(scr)
+    scr.attron(curses.A_BOLD)
+    _safe_addstr(scr, y, 2, "Resumen de basura detectada")
+    scr.attroff(curses.A_BOLD)
+    y += 2
+    
     total_bytes = 0
     total_items = 0
-    print(f"  {BOLD}Resumen de basura detectada{RST}\n")
+    h, w = scr.getmaxyx()
+    max_vis = h - y - 5
+    
     for key, cat in CATEGORIES_REGISTRY.items():
         if not cat.entries:
             continue
-        print_category(cat)
-        print()
+        n = cat.selected_count
+        t = cat.total_bytes if n > 0 else 0
+        
+        if y - 2 < max_vis:
+            scr.attron(curses.A_BOLD)
+            icon = "✔" if n == len(cat.entries) else "~" if n > 0 else "✘"
+            _safe_addstr(scr, y, 2, f"  [{icon}] {cat.name}")
+            scr.attroff(curses.A_BOLD)
+            scr.attron(curses.color_pair(8))
+            _safe_addstr(scr, y + 1, 4, f"{n} elementos, {fmt_size(t)}")
+            scr.attroff(curses.color_pair(8))
+            y += 3
         total_bytes += cat.total_bytes
         total_items += cat.selected_count
-    print(f"  {'─' * 55}")
-    print(f"  {BOLD}TOTAL: {total_items} elementos seleccionados | {fmt_size(total_bytes)}{RST}\n")
+    
+    y += 1
+    scr.attron(curses.color_pair(3) | curses.A_BOLD)
+    _safe_addstr(scr, y, 2, "─" * min(55, w - 4))
+    _safe_addstr(scr, y + 1, 2, f"TOTAL: {total_items} elementos seleccionados | {fmt_size(total_bytes)}")
+    scr.attroff(curses.color_pair(3) | curses.A_BOLD)
+    
+    _draw_footer(scr, "Presiona cualquier tecla para continuar...")
+    scr.refresh()
+    scr.getch()
     return total_items, total_bytes
 
+def _scan_with_spinner(scr):
+    """Run scan with a status display in curses."""
+    h, w = scr.getmaxyx()
+    y = _draw_banner(scr)
+    scr.attron(curses.A_BOLD)
+    _safe_addstr(scr, y, 2, "Escaneando sistema...")
+    scr.attroff(curses.A_BOLD)
+    _draw_footer(scr, "Esto puede tardar varios segundos...")
+    scr.refresh()
+    
+    scan_all_categories()
+    
+    y = _draw_banner(scr)
+    scr.attron(curses.color_pair(2) | curses.A_BOLD)
+    _safe_addstr(scr, y, 2, "✔ Escaneo completado.")
+    scr.attroff(curses.color_pair(2) | curses.A_BOLD)
+    scr.refresh()
+    time.sleep(0.5)
+    return True
 
-def menu_review():
-    """Interactive review: select/deselect categories and entries."""
+def _run_cleanup(scr, all_entries):
+    """Run cleanup with progress in curses."""
+    h, w = scr.getmaxyx()
+    y = _draw_banner(scr)
+    scr.attron(curses.A_BOLD)
+    _safe_addstr(scr, y, 2, "Limpiando archivos...")
+    scr.attroff(curses.A_BOLD)
+    y += 2
+    
+    deleted = 0
+    freed = 0
+    total = len([e for e in all_entries if e.selected])
+    
+    for e in all_entries:
+        if not e.selected:
+            continue
+        path_str = str(e.path)
+        home_str = str(HOME)
+        if path_str.startswith(home_str):
+            path_str = "~" + path_str[len(home_str):]
+        if len(path_str) > w - 10:
+            path_str = "..." + path_str[-(w - 13):]
+        
+        _safe_addstr(scr, y, 2, f"  Borrando {path_str}...")
+        scr.refresh()
+        
+        if _rm_rf(e.path):
+            deleted += 1
+            freed += e.size_bytes
+            _safe_addstr(scr, y, 2, f"  {path_str}  ✔")
+        else:
+            _safe_addstr(scr, y, 2, f"  {path_str}  ✘")
+        scr.refresh()
+        y += 1
+        
+        if y >= h - 3:
+            scr.clear()
+            y = _draw_banner(scr)
+            y += 1
+    
+    # Empty trash via AppleScript
+    try:
+        subprocess.run(["osascript", "-e", 'tell application "Finder" to empty trash'],
+                       capture_output=True)
+    except Exception:
+        pass
+    
+    y += 1
+    scr.attron(curses.color_pair(2) | curses.A_BOLD)
+    _safe_addstr(scr, y, 2, f"✔ Limpieza completada: {deleted} elementos, {fmt_size(freed)} liberados.")
+    scr.attroff(curses.color_pair(2) | curses.A_BOLD)
+    
+    _draw_footer(scr, "Presiona cualquier tecla para continuar...")
+    scr.refresh()
+    scr.getch()
+    return deleted, freed
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CURSES MENU SCREENS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _curses_main_menu(scr):
+    """Main menu. Returns action string: 'scan','review','clean','auto','quit'."""
+    options = [
+        ("Escanear sistema (detectar basura)", "scan"),
+        ("Revisar / seleccionar qué limpiar", "review"),
+        ("Limpiar todo lo seleccionado  ⚠ irreversible", "clean"),
+        ("Auto-limpieza (escanear + limpiar todo)", "auto"),
+        ("Salir", "quit"),
+    ]
+    
+    current = 0
+    scroll = 0
+    h, w = scr.getmaxyx()
+    
     while True:
-        clear()
-        banner()
-        print(f"  {BOLD}Revisar elementos a limpiar{RST}\n")
+        scr.clear()
+        y = _draw_banner(scr)
+        scr.attron(curses.A_BOLD)
+        _safe_addstr(scr, y, 2, "Menú principal")
+        scr.attroff(curses.A_BOLD)
+        y += 2
+        
+        # Show selected totals if scanned
+        if CATEGORIES_REGISTRY:
+            total_bytes = sum(c.total_bytes for c in CATEGORIES_REGISTRY.values())
+            total_items = sum(c.selected_count for c in CATEGORIES_REGISTRY.values())
+            if total_items > 0:
+                scr.attron(curses.color_pair(3))
+                _safe_addstr(scr, y, 2, f"  {total_items} elementos seleccionados ({fmt_size(total_bytes)})")
+                scr.attroff(curses.color_pair(3))
+                y += 2
+        
+        _draw_list(scr, y, options, current, scroll, show_checkbox=False)
+        
+        _draw_footer(scr, "↑↓ navegar  ↵ seleccionar  q salir")
+        scr.refresh()
+        
+        key = scr.getch()
+        if key in (curses.KEY_UP, ord('k')):
+            if current > 0:
+                current -= 1
+                if current < scroll:
+                    scroll = current
+        elif key in (curses.KEY_DOWN, ord('j')):
+            if current < len(options) - 1:
+                current += 1
+                max_vis = max(1, h - (y + 2) - 4)
+                if current >= scroll + max_vis:
+                    scroll = current - max_vis + 1
+        elif key in (10, 13, curses.KEY_ENTER):
+            ch = options[current][1]
+            # Quick key shortcuts also work
+            return ch
+        elif key in (27, ord('q')):
+            return "quit"
+        elif key == ord('s'):
+            return "scan"
+        elif key == ord('r'):
+            return "review"
+        elif key == ord('c'):
+            return "clean"
+        elif key == ord('a'):
+            return "auto"
+        elif key == curses.KEY_RESIZE:
+            scr.clear()
+            h, w = scr.getmaxyx()
+            scroll = min(scroll, max(0, len(options) - 1))
+
+def _curses_review(scr):
+    """Review categories screen."""
+    while True:
         keys = list(CATEGORIES_REGISTRY.keys())
-        for i, key in enumerate(keys, 1):
+        
+        display_items = []
+        for i, key in enumerate(keys):
             cat = CATEGORIES_REGISTRY[key]
             sel = cat.selected_count
             total = len(cat.entries)
             nbytes = cat.total_bytes
-            icon = f"{GREEN}✔{RST}" if sel == total and total > 0 else f"{YELLOW}~{RST}" if sel > 0 else f"{RED}✘{RST}"
-            print(f"  {CYAN}{i:>2}{RST}. [{icon}] {cat.name}  {DIM}({sel}/{total}, {fmt_size(nbytes)}){RST}")
-
-        total_all = sum(c.total_bytes for c in CATEGORIES_REGISTRY.values())
-        total_items = sum(c.selected_count for c in CATEGORIES_REGISTRY.values())
-        print(f"\n  {DIM}TOTAL seleccionado: {total_items} elementos, {fmt_size(total_all)}{RST}")
-        print(f"\n  {YELLOW}[1-{len(keys)}]{RST}  Detalle de categoria")
-        print(f"  {YELLOW}[t]{RST}    Seleccionar todo")
-        print(f"  {YELLOW}[n]{RST}    Deseleccionar todo")
-        print(f"  {YELLOW}[v]{RST}    Volver al menu principal\n")
-
-        ch = input(f"  {CYAN}Elegir:{RST} ").strip().lower()
-        if ch in ("v", "volver", "q"):
+            icon = "✔" if sel == total and total > 0 else "~" if sel > 0 else "✘"
+            display_items.append((f"[{icon}] {cat.name}  ({sel}/{total}, {fmt_size(nbytes)})", key))
+        
+        result = _menu_checkboxes(
+            scr,
+            "Revisar elementos a limpiar",
+            display_items,
+            selected_fn=lambda item: CATEGORIES_REGISTRY[item[1]].selected_count > 0,
+            toggle_fn=lambda item: None,  # Enter goes to detail, not toggle
+            select_all_fn=lambda: _select_all_except_downloads(),
+            deselect_all_fn=lambda: _deselect_all(),
+            extra_footer="↵ ver detalle"
+        )
+        
+        if result is None:
             return
+        
+        # Enter pressed: go into category detail
+        idx = result
+        if 0 <= idx < len(keys):
+            _curses_review_category(scr, keys[idx], CATEGORIES_REGISTRY[keys[idx]])
 
-        if ch == "t":
-            for key, k in CATEGORIES_REGISTRY.items():
-                if key == "downloads_old":
-                    continue
-                for e in k.entries:
-                    e.selected = True
+def _select_all_except_downloads():
+    for key, k in CATEGORIES_REGISTRY.items():
+        if key == "downloads_old":
             continue
+        for e in k.entries:
+            e.selected = True
 
-        if ch == "n":
-            for k in CATEGORIES_REGISTRY.values():
-                for e in k.entries:
-                    e.selected = False
-            continue
+def _deselect_all():
+    for k in CATEGORIES_REGISTRY.values():
+        for e in k.entries:
+            e.selected = False
 
-        try:
-            idx = int(ch) - 1
-            if 0 <= idx < len(keys):
-                key = keys[idx]
-                cat = CATEGORIES_REGISTRY[key]
-                review_category(key, cat)
-        except ValueError:
-            pass
-
-
-def review_category(key: str, cat: JunkCategory):
+def _curses_review_category(scr, key, cat):
+    """Review entries within a category."""
+    entries = cat.entries
+    home_str = str(HOME)
+    
+    def make_label(e):
+        path_str = str(e.path)
+        if path_str.startswith(home_str):
+            path_str = "~" + path_str[len(home_str):]
+        if len(path_str) > 60:
+            path_str = "..." + path_str[-57:]
+        return f"{fmt_size(e.size_bytes):>10}  {path_str}"
+    
+    items = [(make_label(e), e) for e in entries]
+    
+    def sel_fn(item):
+        return item[1].selected
+    
+    def toggle_fn(item):
+        item[1].selected = not item[1].selected
+    
+    def sel_all():
+        for e in entries:
+            e.selected = True
+    
+    def desel_all():
+        for e in entries:
+            e.selected = False
+    
+    current = 0
+    scroll = 0
+    h, w = scr.getmaxyx()
+    
     while True:
-        clear()
-        banner()
-        print(f"  {BOLD}{cat.name}{RST}")
-        print(f"  {DIM}{cat.description}{RST}\n")
-        print(f"  {YELLOW}[s]{RST}  Seleccionar todos")
-        print(f"  {YELLOW}[d]{RST}  Deseleccionar todos")
-        print()
-
-        entries = cat.entries
-        for i, e in enumerate(entries, 1):
-            mark = f"{GREEN}✔{RST}" if e.selected else f"{RED}✘{RST}"
-            path_display = str(e.path)
-            home_str = str(HOME)
-            if path_display.startswith(home_str):
-                path_display = "~" + path_display[len(home_str):]
-            if len(path_display) > 90:
-                path_display = "..." + path_display[-87:]
-            print(f"  {CYAN}{i:>3}{RST}. [{mark}] {fmt_size(e.size_bytes):>10}  {DIM}{path_display}{RST}")
-
-        print(f"\n  {YELLOW}[v]{RST}  Volver")
-        ch = input(f"\n  {CYAN}Elegir numero para toggle o comando:{RST} ").strip().lower()
-
-        if ch in ("v", "volver", "q"):
+        scr.clear()
+        y = _draw_banner(scr)
+        scr.attron(curses.A_BOLD)
+        _safe_addstr(scr, y, 2, cat.name)
+        scr.attroff(curses.A_BOLD)
+        scr.attron(curses.color_pair(8))
+        _safe_addstr(scr, y + 1, 2, cat.description[:w - 4])
+        scr.attroff(curses.color_pair(8))
+        y += 3
+        
+        _draw_list(scr, y, items, current, scroll, selected_fn=sel_fn)
+        
+        _draw_footer(scr, "↑↓ flechas  [espacio] toggle  s:todo d:nada  esc/q volver")
+        scr.refresh()
+        
+        key_press = scr.getch()
+        if key_press == curses.KEY_RESIZE:
+            scr.clear()
+            h, w = scr.getmaxyx()
+            scroll = min(scroll, max(0, len(items) - 1))
+            continue
+        elif key_press in (curses.KEY_UP, ord('k')):
+            if current > 0:
+                current -= 1
+                if current < scroll:
+                    scroll = current
+        elif key_press in (curses.KEY_DOWN, ord('j')):
+            if current < len(items) - 1:
+                current += 1
+                max_vis = max(1, h - (y + 2) - 4)
+                if current >= scroll + max_vis:
+                    scroll = current - max_vis + 1
+        elif key_press == ord(' '):
+            if 0 <= current < len(items):
+                toggle_fn(items[current])
+        elif key_press in (27, ord('q'), ord('v')):
             return
-        elif ch == "s":
-            for e in entries:
-                e.selected = True
-        elif ch == "d":
-            for e in entries:
-                e.selected = False
-        else:
-            try:
-                idx = int(ch) - 1
-                if 0 <= idx < len(entries):
-                    entries[idx].selected = not entries[idx].selected
-            except ValueError:
-                pass
+        elif key_press in (ord('s'),):
+            sel_all()
+        elif key_press in (ord('d'), ord('n')):
+            desel_all()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CURSES MAIN LOOP
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _curses_main(scr):
+    """Main curses loop."""
+    curses.curs_set(0)
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_CYAN, -1)
+    curses.init_pair(2, curses.COLOR_GREEN, -1)
+    curses.init_pair(3, curses.COLOR_YELLOW, -1)
+    curses.init_pair(4, curses.COLOR_RED, -1)
+    curses.init_pair(5, curses.COLOR_MAGENTA, -1)
+    curses.init_pair(7, curses.COLOR_WHITE, -1)
+    curses.init_pair(8, curses.COLOR_WHITE, -1)  # dim text
+    
+    scanned = False
+    
+    while True:
+        action = _curses_main_menu(scr)
+        
+        if action == "quit":
+            scr.clear()
+            y = _draw_banner(scr)
+            scr.attron(curses.color_pair(2) | curses.A_BOLD)
+            _safe_addstr(scr, y, 2, "¡Adiós!")
+            scr.attroff(curses.color_pair(2) | curses.A_BOLD)
+            scr.refresh()
+            time.sleep(0.8)
+            return
+        
+        elif action == "scan":
+            _scan_with_spinner(scr)
+            scanned = True
+            _show_summary(scr)
+        
+        elif action == "review":
+            if not scanned:
+                _show_message(scr, [
+                    "Primero debes escanear el sistema.",
+                    "",
+                    "Selecciona 'Escanear sistema' en el menú principal."
+                ])
+                continue
+            _curses_review(scr)
+        
+        elif action in ("clean", "auto"):
+            if action == "auto" and not scanned:
+                _scan_with_spinner(scr)
+                scanned = True
+            
+            if action == "clean" and not scanned:
+                _show_message(scr, [
+                    "Primero debes escanear el sistema.",
+                    "",
+                    "Selecciona 'Escanear sistema' en el menú principal."
+                ])
+                continue
+            
+            if action == "auto":
+                _select_all_except_downloads()
+            
+            all_entries = [e for cat in CATEGORIES_REGISTRY.values() for e in cat.entries]
+            total_items = sum(1 for e in all_entries if e.selected)
+            total_bytes = sum(e.size_bytes for e in all_entries if e.selected)
+            
+            if total_items == 0:
+                _show_message(scr, ["Nada seleccionado para limpiar."])
+                continue
+            
+            if action == "clean":
+                if not _confirm_dialog(scr, f"¿Borrar {total_items} elementos ({fmt_size(total_bytes)})?  Esta acción NO se puede deshacer."):
+                    continue
+            
+            _run_cleanup(scr, all_entries)
+            scanned = False
 
 
 # ── Deletion engine ─────────────────────────────────────────────────────────
@@ -639,139 +1058,23 @@ def _rm_rf(p: Path) -> bool:
         else:
             return False
         return True
-    except (OSError, PermissionError) as exc:
-        print(f"    {RED}Error al borrar {p}: {exc}{RST}")
+    except (OSError, PermissionError):
         return False
-
-
-def execute_cleanup(entries: List[JunkEntry]) -> Tuple[int, int]:
-    """Delete selected entries. Returns (deleted_count, freed_bytes)."""
-    deleted = 0
-    freed = 0
-    for e in entries:
-        if not e.selected:
-            continue
-        path = e.path
-        print(f"  {YELLOW}Borrando{RST} {DIM}{path}{RST} ...", end=" ")
-        if _rm_rf(path):
-            deleted += 1
-            freed += e.size_bytes
-            print(f"{GREEN}OK{RST}")
-        else:
-            print(f"{RED}FAIL{RST}")
-    return deleted, freed
 
 
 # ── Main ────────────────────────────────────────────────────────────────────
 
 def main():
     if platform.system() != "Darwin":
-        print(f"{RED}Este script solo funciona en macOS.{RST}")
+        print("Este script solo funciona en macOS.")
         sys.exit(1)
-
-    scanned = False
-
-    while True:
-        action = menu_main()
-        if action == "quit":
-            print(f"\n  {GREEN}¡Adiós!{RST}\n")
-            break
-
-        elif action == "scan":
-            clear()
-            banner()
-            print(f"  {YELLOW}Escaneando sistema...{RST} (puede tardar varios segundos)\n")
-            dots = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-            import threading, time
-
-            done_flag = [False]
-
-            def spinner():
-                i = 0
-                while not done_flag[0]:
-                    sys.stdout.write(f"\r  {CYAN}{dots[i % len(dots)]}{RST} Escaneando...")
-                    sys.stdout.flush()
-                    i += 1
-                    time.sleep(0.08)
-                sys.stdout.write("\r" + " " * 40 + "\r")
-                sys.stdout.flush()
-
-            t = threading.Thread(target=spinner)
-            t.start()
-            scan_all_categories()
-            done_flag[0] = True
-            t.join()
-            scanned = True
-            print(f"  {GREEN}✔ Escaneo completado.{RST}")
-            total_items, total_bytes = menu_summary()
-            input(f"\n  {DIM}Presiona ENTER para continuar...{RST}")
-
-        elif action == "review":
-            if not scanned:
-                print(f"\n  {YELLOW}Primero debes escanear.RST")
-                input(f"  {DIM}Presiona ENTER para continuar...{RST}")
-                continue
-            menu_review()
-
-        elif action in ("clean", "auto"):
-            if action == "auto" and not scanned:
-                scan_all_categories()
-                scanned = True
-
-            if action == "clean" and not scanned:
-                print(f"\n  {YELLOW}Primero debes escanear.RST")
-                input(f"  {DIM}Presiona ENTER para continuar...{RST}")
-                continue
-
-            if action == "auto":
-                # Select all except downloads_old (requires manual opt-in)
-                for key, cat in CATEGORIES_REGISTRY.items():
-                    if key == "downloads_old":
-                        continue
-                    for e in cat.entries:
-                        e.selected = True
-
-            total_items, total_bytes = menu_summary()
-            if total_items == 0:
-                print(f"  {YELLOW}Nada seleccionado para limpiar.{RST}")
-                input(f"\n  {DIM}Presiona ENTER para continuar...{RST}")
-                continue
-
-            if action == "clean":
-                print(f"\n  {RED}{BOLD}¡ATENCIÓN! Se borrarán {total_items} elementos ({fmt_size(total_bytes)}).{RST}")
-                print(f"  {RED}Esta acción NO se puede deshacer.{RST}\n")
-                if not prompt_yn(f"{BOLD}¿Confirmas la eliminación?{RST}", default=False):
-                    print(f"  {YELLOW}Cancelado.{RST}")
-                    input(f"\n  {DIM}Presiona ENTER para continuar...{RST}")
-                    continue
-            else:
-                # auto mode
-                print(f"\n  {YELLOW}Auto-limpieza: borrando {total_items} elementos ({fmt_size(total_bytes)})...{RST}\n")
-
-            all_entries = [e for cat in CATEGORIES_REGISTRY.values() for e in cat.entries if e.selected]
-            deleted, freed = execute_cleanup(all_entries)
-
-            # Empty trash properly
-            try:
-                subprocess.run(["osascript", "-e", 'tell application "Finder" to empty trash'],
-                               capture_output=True)
-            except Exception:
-                pass
-
-            print(f"\n  {GREEN}{BOLD}✔ Limpieza completada.{RST}")
-            print(f"  {GREEN}  Se borraron {deleted} elementos liberando {fmt_size(freed)}.{RST}")
-            input(f"\n  {DIM}Presiona ENTER para continuar...{RST}")
-            # Rescan after clean
-            scanned = False
-
-        else:
-            print(f"\n  {RED}Opción no válida.{RST}")
-            input(f"  {DIM}Presiona ENTER para continuar...{RST}")
+    
+    curses.wrapper(_curses_main)
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print(f"\n\n  {YELLOW}Interrumpido por el usuario.{RST}\n")
+        print("\nInterrumpido por el usuario.\n")
         sys.exit(0)
