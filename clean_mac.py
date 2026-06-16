@@ -561,7 +561,9 @@ def menu_review():
             return
 
         if ch == "t":
-            for k in CATEGORIES_REGISTRY.values():
+            for key, k in CATEGORIES_REGISTRY.items():
+                if key == "downloads_old":
+                    continue
                 for e in k.entries:
                     e.selected = True
             continue
@@ -722,8 +724,10 @@ def main():
                 continue
 
             if action == "auto":
-                # Select all
-                for cat in CATEGORIES_REGISTRY.values():
+                # Select all except downloads_old (requires manual opt-in)
+                for key, cat in CATEGORIES_REGISTRY.items():
+                    if key == "downloads_old":
+                        continue
                     for e in cat.entries:
                         e.selected = True
 
