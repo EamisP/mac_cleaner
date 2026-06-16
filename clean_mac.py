@@ -535,9 +535,11 @@ def _draw_list(scr, start_y, items, current_idx, scroll_offset, selected_fn=None
 
 def _menu_checkboxes(scr, title, items, selected_fn, toggle_fn,
                      select_all_fn=None, deselect_all_fn=None,
-                     extra_footer=""):
+                     extra_footer="", show_checkbox=True,
+                     item_formatter=None):
     """Menu with checkboxes. Arrow keys + space to toggle.
-    items: list of tuples (label, data)
+    items: list of tuples (..., data)
+    item_formatter: optional callable(item) -> (label, ...) for dynamic labels
     Returns None to go back.
     """
     current = 0
@@ -546,6 +548,9 @@ def _menu_checkboxes(scr, title, items, selected_fn, toggle_fn,
     
     while True:
         scr.clear()
+        
+        display = [item_formatter(it) for it in items] if item_formatter else items
+        
         y = _draw_banner(scr)
         scr.attron(curses.A_BOLD)
         _safe_addstr(scr, y, 2, title)
@@ -555,14 +560,15 @@ def _menu_checkboxes(scr, title, items, selected_fn, toggle_fn,
         # Show totals
         total_selected = sum(1 for item in items if selected_fn(item))
         total_items = len(items)
-        total_bytes = sum(item[2] for item in items if selected_fn(item) and len(item) > 2 and isinstance(item[2], (int, float)))
+        total_bytes = sum(item[2] for item in display if selected_fn(item) and len(item) > 2 and isinstance(item[2], (int, float)))
         
         scr.attron(curses.color_pair(8))
         _safe_addstr(scr, y, 2, f"{total_selected}/{total_items} seleccionados  |  {fmt_size(total_bytes)}" if total_bytes > 0 else f"{total_selected}/{total_items} seleccionados")
         scr.attroff(curses.color_pair(8))
         y += 2
         
-        _draw_list(scr, y, items, current, scroll, selected_fn=selected_fn)
+        _draw_list(scr, y, display, current, scroll, selected_fn=selected_fn,
+                  show_checkbox=show_checkbox)
         
         footer = f"↑↓ flechas  [espacio] toggle  {extra_footer}  esc/q volver"
         if select_all_fn:
@@ -616,13 +622,18 @@ def _confirm_dialog(scr, msg, default=False):
         y += 3
         
         options = ["  Sí, borrar  ", "  No, cancelar  "]
-        for i, opt in enumerate(options):
+        gap = "    "
+        row = options[0] + gap + options[1]
+        row_x = max(0, (w - len(row)) // 2)
+        x0 = row_x
+        x1 = row_x + len(options[0]) + len(gap)
+        for i, (opt, x) in enumerate([(options[0], x0), (options[1], x1)]):
             if i == selected:
                 scr.attron(curses.A_REVERSE)
-                _safe_addstr(scr, y + i, max(0, (w - len(opt)) // 2), opt)
+                _safe_addstr(scr, y, x, opt)
                 scr.attroff(curses.A_REVERSE)
             else:
-                _safe_addstr(scr, y + i, max(0, (w - len(opt)) // 2), opt)
+                _safe_addstr(scr, y, x, opt)
         
         _draw_footer(scr, "←→ seleccionar  ↵ confirmar")
         scr.refresh()
@@ -696,6 +707,7 @@ def _show_summary(scr):
 
 def _scan_with_spinner(scr):
     """Run scan with a status display in curses."""
+    scr.clear()
     h, w = scr.getmaxyx()
     y = _draw_banner(scr)
     scr.attron(curses.A_BOLD)
@@ -716,6 +728,7 @@ def _scan_with_spinner(scr):
 
 def _run_cleanup(scr, all_entries):
     """Run cleanup with progress in curses."""
+    scr.clear()
     h, w = scr.getmaxyx()
     y = _draw_banner(scr)
     scr.attron(curses.A_BOLD)
@@ -752,7 +765,10 @@ def _run_cleanup(scr, all_entries):
         if y >= h - 3:
             scr.clear()
             y = _draw_banner(scr)
-            y += 1
+            scr.attron(curses.A_BOLD)
+            _safe_addstr(scr, y, 2, "Limpiando archivos...")
+            scr.attroff(curses.A_BOLD)
+            y += 2
     
     # Empty trash via AppleScript
     try:
@@ -849,24 +865,28 @@ def _curses_review(scr):
     while True:
         keys = list(CATEGORIES_REGISTRY.keys())
         
-        display_items = []
-        for i, key in enumerate(keys):
+        # Pass bare keys; formatter generates live labels on each redraw
+        items = [(key,) for key in keys]
+        
+        def format_item(it):
+            key = it[0]
             cat = CATEGORIES_REGISTRY[key]
             sel = cat.selected_count
             total = len(cat.entries)
-            nbytes = cat.total_bytes
             icon = "✔" if sel == total and total > 0 else "~" if sel > 0 else "✘"
-            display_items.append((f"[{icon}] {cat.name}  ({sel}/{total}, {fmt_size(nbytes)})", key))
+            return (f"[{icon}] {cat.name}  ({sel}/{total}, {fmt_size(cat.total_bytes)})", key)
         
         result = _menu_checkboxes(
             scr,
             "Revisar elementos a limpiar",
-            display_items,
-            selected_fn=lambda item: CATEGORIES_REGISTRY[item[1]].selected_count > 0,
-            toggle_fn=lambda item: None,  # Enter goes to detail, not toggle
+            items,
+            selected_fn=lambda item: CATEGORIES_REGISTRY[item[-1]].selected_count > 0,
+            toggle_fn=lambda item: _toggle_category(CATEGORIES_REGISTRY[item[-1]]),
             select_all_fn=lambda: _select_all_except_downloads(),
             deselect_all_fn=lambda: _deselect_all(),
-            extra_footer="↵ ver detalle"
+            extra_footer="↵ ver detalle",
+            show_checkbox=False,
+            item_formatter=format_item
         )
         
         if result is None:
@@ -888,6 +908,15 @@ def _deselect_all():
     for k in CATEGORIES_REGISTRY.values():
         for e in k.entries:
             e.selected = False
+
+def _toggle_category(cat):
+    """Toggle all entries in a category."""
+    if all(e.selected for e in cat.entries):
+        for e in cat.entries:
+            e.selected = False
+    else:
+        for e in cat.entries:
+            e.selected = True
 
 def _curses_review_category(scr, key, cat):
     """Review entries within a category."""
